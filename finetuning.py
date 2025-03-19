@@ -10,10 +10,10 @@
 
 from unsloth import FastLanguageModel
 import torch
-from datasets import load_dataset
 from trl import SFTTrainer
 from transformers import TrainingArguments
 from unsloth import is_bfloat16_supported
+from datasets import load_dataset, DatasetDict
 
 
 max_seq_length = 2048 # Choose any!
@@ -22,7 +22,7 @@ load_in_4bit = True # Use 4bit quantization to reduce memory usage. Can be False
 
 # Download Llama from unsloth
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/DeepSeek-R1-Distill-Llama-8B",
+    model_name = "/tmp/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     max_seq_length = max_seq_length,
     dtype = dtype,
     load_in_4bit = load_in_4bit,
@@ -53,19 +53,25 @@ def formatting_prompts_func(examples):
     return {"text": texts}
 
 # Load Dataset (Local JSON)
-dataset = load_dataset("json", data_files="evolution-with-cot.json", split="train")
+dataset = load_dataset("json", data_files="evolution-with-cot.json")["train"]
+
+# split 80% training, 20% validation + test.
+train_testvalid = dataset.train_test_split(test_size=0.2, seed=42)
+
+# Further split the remaining 20% into 10% validation and 10% test
+test_valid = train_testvalid["test"].train_test_split(test_size=0.5, seed=42)
+
+# Construct the final dataset dictionary
+dataset = DatasetDict({
+    "train": train_testvalid["train"],
+    "validation": test_valid["train"],
+    "test": test_valid["test"]
+})
+
 
 dataset = dataset.map(formatting_prompts_func, batched=True)
 print(dataset[0])
 print(dataset["text"][0])
-
-
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/DeepSeek-R1-Distill-Llama-8B",
-    max_seq_length = max_seq_length,
-    dtype = dtype,
-    load_in_4bit = load_in_4bit
-)
 
 
 # Set training parameters
@@ -75,13 +81,8 @@ model = FastLanguageModel.get_peft_model(
     model,
     r=16,
     target_modules=[
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
     ],
     lora_alpha=16,
     lora_dropout=0,
@@ -96,7 +97,8 @@ model = FastLanguageModel.get_peft_model(
 trainer = SFTTrainer(
     model = model,
     tokenizer = tokenizer,
-    train_dataset = dataset,
+    train_dataset = dataset["train"],
+    eval_dataset=dataset["validation"],  
     dataset_text_field = "text",
     max_seq_length = max_seq_length,
     dataset_num_proc = 2,
@@ -116,9 +118,54 @@ trainer = SFTTrainer(
         lr_scheduler_type = "linear",
         seed = 3407,
         output_dir = "outputs",
+        evaluation_strategy="steps",  
+        eval_steps=10, 
+        save_steps=10,  
         report_to = "none", # Use this for WandB etc
     ),
 )
 
 # training
 trainer_stats = trainer.train()
+
+
+# Inference function
+def inference_on_dataset(model, tokenizer, dataset):
+    model.eval()
+    results = []
+
+    for example in dataset:
+        input_text = example["Question"]
+        
+        #Only provide the input question, let the model generate the reasoning and response
+        formatted_input = train_prompt_style.format(input_text, "", "")  # Empty placeholders for CoT and Response
+
+        inputs = tokenizer(formatted_input, return_tensors="pt", truncation=True, max_length=max_seq_length).to(model.device)
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=1200,
+                pad_token_id=tokenizer.eos_token_id,
+                use_cache=True,
+            )
+        
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        results.append({
+            "input": input_text,
+            "output": generated_text,
+        })
+
+    return results
+
+# Perform inference on the test set
+test_results = inference_on_dataset(model, tokenizer, dataset["test"])
+
+# Save test results to JSON file
+import json
+
+with open("test_results.json", "w", encoding="utf-8") as f:
+    json.dump(test_results, f, ensure_ascii=False, indent=4)
+
+print("Test results saved to 'test_results.json'")
